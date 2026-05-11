@@ -4,6 +4,8 @@
  *      gcc dft_detect.c -lm -o dft_detect
  *  speedup:
  *      gcc -Ofast dft_detect.c -lm -o dft_detect
+ *  with FFTW (faster correlation):
+ *      gcc -DHAVE_FFTW3 -Ofast dft_detect.c -lm -lfftw3f -o dft_detect
  *
  *  author: zilog80
  */
@@ -13,6 +15,23 @@
 #include <string.h>
 #include <math.h>
 #include <complex.h>
+
+#ifdef HAVE_FFTW3
+#include <fftw3.h>
+// Forward DFT plan; built once N_DFT is known.
+static fftwf_plan dft_fwd_plan = NULL;
+// Buffers passed to fftwf_execute_dft() must be at least as aligned as the
+// buffers used at plan time. Plain calloc() only guarantees 8 bytes on some
+// 32-bit platforms, below FFTW's 16-byte SIMD requirement, so we route the
+// complex buffers used by dft_raw() through fftwf_alloc_complex/fftwf_free.
+// FFTW_UNALIGNED would also work but disables SIMD and roughly halves the
+// speedup.
+#define ALLOC_DFT_COMPLEX(n) ((float complex *)fftwf_alloc_complex(n))
+#define FREE_DFT_COMPLEX(p)  fftwf_free(p)
+#else
+#define ALLOC_DFT_COMPLEX(n) ((float complex *)calloc((n), sizeof(float complex)))
+#define FREE_DFT_COMPLEX(p)  free(p)
+#endif
 
 #ifndef M_PI
     #define M_PI  (3.1415926535897932384626433832795)
@@ -298,6 +317,13 @@ static int dsp__lpIQtaps; // ui32_t
 static float complex *lpIQ_buf;
 
 
+#ifdef HAVE_FFTW3
+// In-place forward DFT via FFTW. float complex and fftwf_complex share
+// the same memory layout (float[2]) so the cast is safe.
+static void dft_raw(float complex *Z) {
+    fftwf_execute_dft(dft_fwd_plan, (fftwf_complex *)Z, (fftwf_complex *)Z);
+}
+#else
 static void dft_raw(float complex *Z) {
     int s, l, l2, i, j, k;
     float complex  w1, w2, T;
@@ -333,6 +359,7 @@ static void dft_raw(float complex *Z) {
         }
     }
 }
+#endif
 
 static void dft(float *x, float complex *Z) {
     int i;
@@ -1219,14 +1246,29 @@ static int init_buffers() {
     db = calloc(N_DFT+1, sizeof(float));  if (db == NULL) return -1;
 
     ew = calloc(LOG2N+1, sizeof(float complex));  if (ew == NULL) return -1;
-    X  = calloc(N_DFT+1, sizeof(float complex));  if (X  == NULL) return -1;
-    Z  = calloc(N_DFT+1, sizeof(float complex));  if (Z  == NULL) return -1;
-    cx = calloc(N_DFT+1, sizeof(float complex));  if (cx == NULL) return -1;
+    X  = ALLOC_DFT_COMPLEX(N_DFT+1);  if (X  == NULL) return -1;
+    Z  = ALLOC_DFT_COMPLEX(N_DFT+1);  if (Z  == NULL) return -1;
+    cx = ALLOC_DFT_COMPLEX(N_DFT+1);  if (cx == NULL) return -1;
 
     for (n = 0; n < LOG2N; n++) {
         k = 1 << n;
         ew[n] = cexp(-I*M_PI/(float)k);
     }
+
+#ifdef HAVE_FFTW3
+    // Build the forward plan with FFTW_ESTIMATE so plan creation stays cheap;
+    // dft_detect is typically a short-lived invocation. The plan is created
+    // against a throwaway aligned scratch buffer; fftwf_execute_dft() will
+    // later run it against the caller's actual buffers.
+    {
+        fftwf_complex *scratch = fftwf_alloc_complex(N_DFT);
+        if (scratch == NULL) return -1;
+        dft_fwd_plan = fftwf_plan_dft_1d(N_DFT, scratch, scratch,
+                                         FFTW_FORWARD, FFTW_ESTIMATE);
+        fftwf_free(scratch);
+        if (dft_fwd_plan == NULL) return -1;
+    }
+#endif
 
     match = (float *)calloc( L+1, sizeof(float)); if (match == NULL) return -1;
     m = (float *)calloc(N_DFT+1, sizeof(float));  if (m  == NULL) return -1;
@@ -1234,7 +1276,7 @@ static int init_buffers() {
 
     for (j = 0; j < idxRS; j++)
     {
-        rs_hdr[j].Fm = (float complex *)calloc(N_DFT+1, sizeof(float complex));  if (rs_hdr[j].Fm == NULL) return -1;
+        rs_hdr[j].Fm = ALLOC_DFT_COMPLEX(N_DFT+1);  if (rs_hdr[j].Fm == NULL) return -1;
         bits = rs_hdr[j].header;
         spb = rs_hdr[j].spb;
         sigma = sqrt(log(2)) / (2*M_PI*rs_hdr[j].BT);
@@ -1275,7 +1317,7 @@ static int init_buffers() {
     if (option_iq)
     {
         for (j = 0; j < 2; j++) {
-            WS[j] = (float complex *)calloc(N_DFT+1, sizeof(float complex));  if (WS[j] == NULL) return -1;
+            WS[j] = ALLOC_DFT_COMPLEX(N_DFT+1);  if (WS[j] == NULL) return -1;
             for (i = 0; i < dsp__lpFMtaps; i++) m[i] = ws_lpFM[j][i];
             while (i < N_DFT) m[i++] = 0.0;
             dft(m, WS[j]);
@@ -1302,12 +1344,16 @@ static int free_buffers() {
     if (xn) { free(xn); xn = NULL; }
     if (db) { free(xn); xn = NULL; }
     if (ew) { free(ew); ew = NULL; }
-    if (X)  { free(X);  X  = NULL; }
-    if (Z)  { free(Z);  Z  = NULL; }
-    if (cx) { free(cx); cx = NULL; }
+    if (X)  { FREE_DFT_COMPLEX(X);  X  = NULL; }
+    if (Z)  { FREE_DFT_COMPLEX(Z);  Z  = NULL; }
+    if (cx) { FREE_DFT_COMPLEX(cx); cx = NULL; }
+
+#ifdef HAVE_FFTW3
+    if (dft_fwd_plan) { fftwf_destroy_plan(dft_fwd_plan); dft_fwd_plan = NULL; }
+#endif
 
     for (j = 0; j < idxRS; j++) {
-        if (rs_hdr[j].Fm) { free(rs_hdr[j].Fm); rs_hdr[j].Fm = NULL; }
+        if (rs_hdr[j].Fm) { FREE_DFT_COMPLEX(rs_hdr[j].Fm); rs_hdr[j].Fm = NULL; }
     }
 
 
@@ -1324,7 +1370,7 @@ static int free_buffers() {
     if (option_iq) {
         for (j = 0; j < 2; j++) {
             if (ws_lpFM[j]) { free(ws_lpFM[j]); ws_lpFM[j] = NULL; }
-            if (WS[j]) { free(WS[j]); WS[j] = NULL; }
+            if (WS[j]) { FREE_DFT_COMPLEX(WS[j]); WS[j] = NULL; }
         }
         if (Y) { free(Y); Y = NULL; }
 
