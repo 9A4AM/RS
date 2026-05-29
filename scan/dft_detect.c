@@ -193,7 +193,7 @@ static float set_lpIQ = 0.0;
 #define tn_IMET1rs   28
 #define tn_IMET1ab   29
 
-#define idxIMETafsk  16
+static int idxIMETafsk = 16;
 #define idxRS        17
 #define idxI4        18
 #define Nrs          19
@@ -214,16 +214,12 @@ static rsheader_t rs_hdr[Nrs] = {
     { 4800, 0, 0, weathex_header,  1.0, 0.0, 0.65, 2, NULL, "WXR301",   tn_WXR301,   0, 3, 0.0, 0.0},
     { 5000, 0, 0, wxr2pn9_header,  1.0, 0.0, 0.65, 2, NULL, "WXRPN9",   tn_WXRpn9,   0, 3, 0.0, 0.0},
     { 9600, 0, 0, imet1ab_header,  1.0, 0.0, 0.80, 2, NULL, "IMET1AB",  tn_IMET1ab,  1, 3, 0.0, 0.0}, // (rs_hdr[idxAB])
+    //idxIMETafsk:
     { 9600, 0, 0, imet_preamble,   0.5, 0.0, 0.80, 4, NULL, "IMETafsk", tn_IMETa  ,  1, 1, 0.0, 0.0}, // IMET1AB, IMET1RS (IQ)IMET4
     { 9600, 0, 0, imet1rs_header,  0.5, 0.0, 0.80, 2, NULL, "IMET1RS",  tn_IMET1rs,  0, 3, 0.0, 0.0}, // (rs_hdr[idxRS]) IMET4: lpIQ=0 ...
     { 9600, 0, 0, imet1rs_header,  0.5, 0.0, 0.80, 2, NULL, "IMET4",    tn_IMET4,    1, 1, 0.0, 0.0}, // (rs_hdr[idxI4])
 };
 
-static int idx_MTS01 = -1,
-           idx_C34C50 = -1,
-           idx_WXR301 = -1,
-           idx_WXRPN9 = -1,
-           idx_IMET1AB = -1;
 
 // --types filter: 1 = scan, 0 = skip. default all-on.
 static int type_enabled[Nrs];
@@ -1192,43 +1188,13 @@ static int init_buffers() {
     IQdc.maxcnt = sample_rate/32;
     if (dsp__decM > 1) IQdc.maxcnt *= dsp__decM;
 
-
-    for (j = 0; j < Nrs; j++) {
-        #ifdef NOMTS01
-        if ( strncmp(rs_hdr[j].type, "MTS01", 5) == 0 ) idx_MTS01 = j;
-        #endif
-        #ifdef NOC34C50
-        if ( strncmp(rs_hdr[j].type, "C34C50", 6) == 0 ) idx_C34C50 = j;
-        #endif
-        #ifdef NOWXR301
-        if ( strncmp(rs_hdr[j].type, "WXR301", 5) == 0 ) idx_WXR301 = j;
-        if ( strncmp(rs_hdr[j].type, "WXRPN9", 5) == 0 ) idx_WXRPN9 = j;
-        #endif
-        #ifdef NOIMET1AB
-        if ( strncmp(rs_hdr[j].type, "IMET1AB", 7) == 0 ) idx_IMET1AB = j;
-        #endif
-    }
-
     for (j = 0; j < Nrs; j++) {
         rs_hdr[j].spb = sample_rate/(float)rs_hdr[j].sps;
         rs_hdr[j].hLen = strlen(rs_hdr[j].header);
         rs_hdr[j].L = rs_hdr[j].hLen * rs_hdr[j].spb + 0.5;
-        if (j != idx_MTS01 && j != idx_C34C50 && j != idx_WXR301 && j != idx_WXRPN9 && j != idx_IMET1AB) {
-            if (rs_hdr[j].hLen > hLen) hLen = rs_hdr[j].hLen;
-            if (rs_hdr[j].L > Lmax) Lmax = rs_hdr[j].L;
-        }
-    }
 
-    // warn if --types asked for an ifdef-excluded type
-    if (user_set_types) {
-        for (j = 0; j < Nrs; j++) {
-            if (type_enabled[j] && (j == idx_MTS01 || j == idx_C34C50
-                                 || j == idx_WXR301 || j == idx_WXRPN9
-                                 || j == idx_IMET1AB)) {
-                fprintf(stderr, "warning: type '%s' excluded at compile time\n",
-                                rs_hdr[j].type);
-            }
-        }
+        if (rs_hdr[j].hLen > hLen) hLen = rs_hdr[j].hLen;
+        if (rs_hdr[j].L > Lmax) Lmax = rs_hdr[j].L;
     }
 
     // L = hLen * sample_rate/2500.0 + 0.5; // max(hLen*spb)
@@ -1439,7 +1405,11 @@ int main(int argc, char **argv) {
 #endif
     setbuf(stdout, NULL);
 
-    for (j = 0; j < Nrs; j++) type_enabled[j] = 1;
+    // Default: scan for every sonde type. --types may narrow this.
+    for (j = 0; j < Nrs; j++) {
+        type_enabled[j] = 1;
+        if ( strncmp(rs_hdr[j].type, "IMETafsk", 8) == 0 ) idxIMETafsk = j;
+    }
 
     fpname = argv[0];
     ++argv;
@@ -1691,11 +1661,6 @@ int main(int argc, char **argv) {
             for (j = 0; j <= idxIMETafsk; j++) { // incl. IMET-preamble
 
                 if ( !type_enabled[j] ) continue; // --types
-                if ( j == idx_MTS01 ) continue;   // only ifdef NOMTS01
-                if ( j == idx_C34C50 ) continue;  // only ifdef NOC34C50
-                if ( j == idx_WXR301 ) continue;  // only ifdef NOWXR301
-                if ( j == idx_WXRPN9 ) continue;  // only ifdef NOWXR301
-                if ( j == idx_IMET1AB ) continue; // only ifdef NOIMET1AB
 
                 mv0_pos[j] = mv_pos[j];
                 mp[j] = getCorrDFT(K, 0, mv+j, mv_pos+j, rs_hdr+j);
