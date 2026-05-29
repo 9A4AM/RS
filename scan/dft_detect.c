@@ -225,6 +225,10 @@ static int idx_MTS01 = -1,
            idx_WXRPN9 = -1,
            idx_IMET1AB = -1;
 
+// --types filter: 1 = scan, 0 = skip. default all-on.
+static int type_enabled[Nrs];
+static int user_set_types = 0;
+
 
 static int rs_detect2[Nrs];
 
@@ -1215,6 +1219,18 @@ static int init_buffers() {
         }
     }
 
+    // warn if --types asked for an ifdef-excluded type
+    if (user_set_types) {
+        for (j = 0; j < Nrs; j++) {
+            if (type_enabled[j] && (j == idx_MTS01 || j == idx_C34C50
+                                 || j == idx_WXR301 || j == idx_WXRPN9
+                                 || j == idx_IMET1AB)) {
+                fprintf(stderr, "warning: type '%s' excluded at compile time\n",
+                                rs_hdr[j].type);
+            }
+        }
+    }
+
     // L = hLen * sample_rate/2500.0 + 0.5; // max(hLen*spb)
     L = 2*Lmax;
 
@@ -1423,6 +1439,8 @@ int main(int argc, char **argv) {
 #endif
     setbuf(stdout, NULL);
 
+    for (j = 0; j < Nrs; j++) type_enabled[j] = 1;
+
     fpname = argv[0];
     ++argv;
     while ((*argv) && (!wavloaded)) {
@@ -1434,6 +1452,17 @@ int main(int argc, char **argv) {
             fprintf(stderr, "       --iq        (IF iq-data)\n");
             fprintf(stderr, "       --IQ <fq>   (baseband IQ at fq)\n");
             fprintf(stderr, "       --bw <kHz>  (set IQ filter bw/kHz)\n");
+            fprintf(stderr, "       --types <list>  (comma-separated rs_hdr type names to scan,\n");
+            fprintf(stderr, "                        e.g. DFM9,RS41,RS92; default: scan all)\n");
+            fprintf(stderr, "  types:");
+            for (j = 0; j < Nrs; j++) {
+                if (j == idxIMETafsk) continue; // == IMET1RS, IMET4
+                fprintf(stderr, "%s", j % 8 ? " " : "\n       ");
+                fprintf(stderr, "%s", rs_hdr[j].type);
+                if (strncmp(rs_hdr[j].type, "DFM9", 4) == 0) fprintf(stderr, " (== DFM6, DFM17)");
+                if (strncmp(rs_hdr[j].type, "M10", 4) == 0) fprintf(stderr, " (== M20)");
+                fprintf(stderr, "%s", j < Nrs-1 ? "," : "\n");
+            }
             return 0;
         }
         else if ( (strcmp(*argv, "-v") == 0) || (strcmp(*argv, "--verbose") == 0) ) {
@@ -1456,6 +1485,62 @@ int main(int argc, char **argv) {
             if (*argv) bw_kHz = atof(*argv); else return -1;
             if (bw_kHz < 1.0) bw_kHz = 0.0; // min. 1kHz
             set_lpIQ = bw_kHz * 1e3;
+        }
+        else if   (strcmp(*argv, "--types") == 0) {
+            // --types T1,T2,... : case-sensitive, whitespace trimmed
+            ++argv;
+            if (*argv == NULL || (*argv)[0] == '\0') {
+                fprintf(stderr, "error: --types requires a non-empty comma-separated list\n");
+                return -1;
+            }
+            user_set_types = 1;
+            int n;
+            for (n = 0; n < Nrs; n++) type_enabled[n] = 0;
+            const char *p = *argv;
+            const char *start = p;
+            while (1) {
+                if (*p == ',' || *p == '\0') {
+                    char token[64];
+                    size_t len = (size_t)(p - start);
+                    if (len >= sizeof(token)) {
+                        // bad token, skip it but keep going
+                        fprintf(stderr, "warning: --types: token too long, ignored\n");
+                    }
+                    else {
+                        memcpy(token, start, len);
+                        token[len] = '\0';
+                        char *t = token;
+                        while (*t == ' ' || *t == '\t') t++;
+                        char *e = token + strlen(token);
+                        while (e > t && (*(e-1) == ' ' || *(e-1) == '\t')) { e--; *e = '\0'; }
+                        if (*t != '\0') {
+                            int matched = 0;
+                            for (n = 0; n < Nrs; n++) {
+                                if (strcmp(rs_hdr[n].type, t) == 0) {
+                                    type_enabled[n] = 1;
+                                    matched = 1;
+                                    if (n > idxIMETafsk) type_enabled[idxIMETafsk] = 1; // IMET1RS/IMET4 need AFSK preamble
+                                    break;
+                                }
+                            }
+                            if (!matched) {
+                                fprintf(stderr, "warning: --types: unknown sonde type '%s', ignored\n", t);
+                            }
+                        }
+                    }
+                    if (*p == '\0') break;
+                    start = p + 1;
+                }
+                p++;
+            }
+            // nothing valid in the list? fall back to scanning everything
+            // so the run keeps going (warning above tells the user why).
+            int any = 0;
+            for (n = 0; n < Nrs; n++) if (type_enabled[n]) { any = 1; break; }
+            if (!any) {
+                fprintf(stderr, "warning: --types: no valid types given, scanning all\n");
+                for (n = 0; n < Nrs; n++) type_enabled[n] = 1;
+            }
         }
         else if ( (strcmp(*argv, "--dc") == 0) ) { option_dc = 1; }
         else if   (strcmp(*argv, "--min") == 0) {
@@ -1605,6 +1690,7 @@ int main(int argc, char **argv) {
         if (k >= K-4) {
             for (j = 0; j <= idxIMETafsk; j++) { // incl. IMET-preamble
 
+                if ( !type_enabled[j] ) continue; // --types
                 if ( j == idx_MTS01 ) continue;   // only ifdef NOMTS01
                 if ( j == idx_C34C50 ) continue;  // only ifdef NOC34C50
                 if ( j == idx_WXR301 ) continue;  // only ifdef NOWXR301
@@ -1624,6 +1710,7 @@ int main(int argc, char **argv) {
         header_found = 0;
         for (j = 0; j <= idxIMETafsk; j++) // incl. IMET-preamble
         {
+            if ( !type_enabled[j] ) continue; // --types
             if (mp[j] > 0 && (mv[j] > rs_hdr[j].thres || mv[j] < -rs_hdr[j].thres)) {
                 if (mv_pos[j] > mv0_pos[j]) {
 
